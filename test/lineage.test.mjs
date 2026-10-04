@@ -606,6 +606,48 @@ test('平衡复核输入校验：启用时限值必须为非负整数；缺省�
   assert.equal(legacy.spec.balance.enabled, false);
 });
 
+test('性能回归：全连通 5 帧 ×8 斑点，宽松平衡限值（7）须即时返回且不改变裁决', () => {
+  // 全部斑点同坐标（maxDist=0 全连通），每帧亮度按录入序号 1..8；
+  // 无漏检、末帧目标 8，最优谱系为满二叉分裂 1/2/4/8/8、总亮度 114。
+  // 该输入存在满足平衡限制的最优谱系（实际全部 0/1 差值分裂），
+  // 旧实现在启用复核、限值 7 时内层状态爆炸（>10s 无结果乃至 OOM）。
+  const frames = [];
+  for (let t = 0; t < 5; t++) {
+    const fr = [];
+    for (let i = 0; i < 8; i++) fr.push({ id: `f${t}_${i}`, x: 0, y: 0, b: i + 1 });
+    frames.push(fr);
+  }
+  const input = {
+    frames, startId: 'f0_0', maxDist: 0, maxSkip: 0, target: 8,
+  };
+
+  // 关闭复核：保持原有结果与耗时表现
+  const off = run(input);
+  assertValidLineage(off.spec, off.sol, input);
+  assert.deepEqual(off.sol.counts, [1, 2, 4, 8, 8]);
+  assert.equal(off.sol.totalBrightness, 114);
+  assert.equal(off.sol.skips, 0);
+
+  // 启用复核、宽松限值 7：必须在交互时限内返回同一最优业务结果
+  const on = run(withBalance(input, 7));
+  const t0 = Date.now();
+  const againRaw = solveLineage(on.spec);
+  const ms = Date.now() - t0;
+  const again = presentSolution(on.spec, againRaw);
+  assertValidLineage(on.spec, on.sol, withBalance(input, 7));
+  assertBalanced(on.spec, on.sol, 7);
+  assert.ok(ms < 5000, `启用复核求解耗时 ${ms}ms 超出交互时限`);
+  assert.deepEqual(again.counts, [1, 2, 4, 8, 8]);
+  assert.equal(again.totalBrightness, 114);
+  assert.equal(again.skips, 0);
+  assert.equal(again.divisions, 7);
+  assert.equal(on.sol.divisions, 7);
+  // 限值放宽不得改变最优裁决语义：两种开关给出同一谱系
+  assert.deepEqual(on.sol.used, off.sol.used);
+  assert.equal(on.sol.totalBrightness, off.sol.totalBrightness);
+  assert.equal(on.sol.skips, off.sol.skips);
+});
+
 // ---------- 带平衡约束的独立暴力枚举对拍 ----------
 function bruteForceBalanced(spec, maxDiff) {
   const { frames, startIndex, maxDist, maxSkip, target } = spec;
