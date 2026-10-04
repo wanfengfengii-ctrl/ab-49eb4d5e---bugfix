@@ -606,6 +606,73 @@ test('平衡复核输入校验：启用时限值必须为非负整数；缺省�
   assert.equal(legacy.spec.balance.enabled, false);
 });
 
+test('回归：全连通 5×8、限值宽松(7)的合法输入即时返回最优平衡谱系', () => {
+  // 5 帧、每帧 8 个同坐标斑点，亮度按录入顺序 1..8，起始为首帧首个斑点；
+  // 最大位移 / 漏检额度 0，终帧存活 8。最优谱系满帧采用，总亮度 114。
+  const fullInput = () => {
+    const frames = [];
+    for (let t = 0; t < 5; t++) {
+      const fr = [];
+      for (let i = 0; i < 8; i++) fr.push({ id: `s${t}_${i}`, x: 0, y: 0, b: i + 1 });
+      frames.push(fr);
+    }
+    return {
+      frames, startId: 's0_0', maxDist: 0, maxSkip: 0, target: 8,
+    };
+  };
+
+  const off = run(fullInput());
+  assertValidLineage(off.spec, off.sol, fullInput());
+  assert.deepEqual(off.sol.counts, [1, 2, 4, 8, 8]);
+  assert.equal(off.sol.totalBrightness, 114);
+  assert.equal(off.sol.skips, 0);
+  assert.equal(off.sol.divisions, 7);
+
+  // 启用复核、限值 7（= target-1，宽松到无约束力）：必须在交互时间内返回
+  // 与关闭复核一致的裁决，且每次分裂实际差值不越限、共 7 次分裂。
+  const t0 = performance.now();
+  const on = run(withBalance(fullInput(), 7));
+  const ms = performance.now() - t0;
+  assertValidLineage(on.spec, on.sol, withBalance(fullInput(), 7));
+  assertBalanced(on.spec, on.sol, 7);
+  assert.ok(ms < 2000, `宽松限值求解应在 2s 内完成，实际 ${ms.toFixed(0)}ms`);
+  assert.deepEqual(on.sol.counts, [1, 2, 4, 8, 8]);
+  assert.equal(on.sol.totalBrightness, 114);
+  assert.equal(on.sol.skips, 0);
+  assert.equal(on.sol.divisions, 7);
+  assert.equal(on.sol.balance.splits.length, 7);
+  // 不改变最优裁决语义：与关闭复核时的采用结果完全一致
+  assert.deepEqual(on.sol.used, off.sol.used);
+  assert.equal(on.sol.totalBrightness, off.sol.totalBrightness);
+  assert.equal(on.sol.skips, off.sol.skips);
+
+  // 限值 6（= target-2，恰为任一二叉分裂可能的最大叶数差）同样无约束力，
+  // 走同一化简路径并给出一致结果。
+  const on6 = run(withBalance(fullInput(), 6));
+  assertBalanced(on6.spec, on6.sol, 6);
+  assert.equal(on6.sol.totalBrightness, 114);
+  assert.deepEqual(on6.sol.used, off.sol.used);
+});
+
+test('回归：宽松限值不掩盖不可行（几何断开仍判无解）', () => {
+  // 每帧 8 斑点但沿 x 漂移，maxDist=10 时每条路径每帧只接得到 1 个斑点，
+  // 无法增长到终帧 8；宽松限值 7 不得把它误报为可行。
+  const frames = [];
+  for (let t = 0; t < 5; t++) {
+    const fr = [];
+    for (let i = 0; i < 8; i++) fr.push({ id: `d${t}_${i}`, x: t * 10, y: i, b: i + 1 });
+    frames.push(fr);
+  }
+  const input = {
+    frames, startId: 'd0_0', maxDist: 10, maxSkip: 0, target: 8,
+    balanceEnabled: true, balanceDiff: 7,
+  };
+  const { raw, sol } = run(input);
+  assert.equal(raw.feasible, false);
+  assert.equal(sol.feasible, false);
+  assert.ok(sol.earliestBreakLabel.includes('帧'));
+});
+
 // ---------- 带平衡约束的独立暴力枚举对拍 ----------
 function bruteForceBalanced(spec, maxDiff) {
   const { frames, startIndex, maxDist, maxSkip, target } = spec;
@@ -770,4 +837,59 @@ test('随机对拍：启用平衡复核时与独立暴力枚举（含平衡过�
     assert.equal(tupleLex(sig, bf.sig), 0, `迭代 ${iter} 输入顺序裁决不一致`);
   }
   assert.ok(feasibleCases >= 30, `平衡可行对拍用例过少: ${feasibleCases}`);
+});
+
+test('随机对拍：宽松限值（≥target−2）启用复核与关闭复核裁决完全一致（无约束力化简）', () => {
+  const rand = rng(987654321);
+  let feasibleCases = 0;
+  let checked = 0;
+  for (let iter = 0; iter < 4000 && feasibleCases < 300; iter++) {
+    const F = rand() < 0.4 ? 5 : 4;
+    const frames = [];
+    for (let t = 0; t < F; t++) {
+      const n = 2 + Math.floor(rand() * 3);
+      const fr = [];
+      for (let i = 0; i < n; i++) {
+        fr.push({
+          id: `w${t}_${i}`,
+          x: Math.floor(rand() * 4),
+          y: Math.floor(rand() * 4),
+          b: Math.floor(rand() * 9) + 1,
+        });
+      }
+      frames.push(fr);
+    }
+    const target = 1 + Math.floor(rand() * Math.min(4, frames[F - 1].length));
+    // 限值取 [target-2 .. target+2] 内的非负数，覆盖阈值两侧
+    const lo = Math.max(0, target - 2);
+    const maxDiff = lo + Math.floor(rand() * 4);
+    const input = {
+      frames,
+      startId: frames[0][Math.floor(rand() * frames[0].length)].id,
+      maxDist: 1 + Math.floor(rand() * 3),
+      maxSkip: rand() < 0.5 ? 0 : 1,
+      target,
+    };
+    checked++;
+    const offSpec = normalizeSpec(input).spec;
+    const offSol = presentSolution(offSpec, solveLineage(offSpec));
+    const onInput = { ...input, balanceEnabled: true, balanceDiff: maxDiff };
+    const onSpec = normalizeSpec(onInput).spec;
+    const onSol = presentSolution(onSpec, solveLineage(onSpec));
+    assert.equal(onSol.feasible, offSol.feasible,
+      `迭代 ${iter}：宽松限值下可行性应与无约束一致 (target=${target}, d=${maxDiff})`);
+    if (!offSol.feasible) continue;
+    feasibleCases++;
+    assertValidLineage(onSpec, onSol, onInput);
+    assertBalanced(onSpec, onSol, maxDiff);
+    assert.equal(onSol.totalBrightness, offSol.totalBrightness,
+      `迭代 ${iter} 总亮度`);
+    assert.equal(onSol.skips, offSol.skips, `迭代 ${iter} 漏检数`);
+    assert.deepEqual(onSol.used, offSol.used, `迭代 ${iter} 采用集合`);
+    assert.deepEqual(
+      onSol.edges.map((e) => [e.fromFrame, e.fromId, e.toFrame, e.toId, e.gap]),
+      offSol.edges.map((e) => [e.fromFrame, e.fromId, e.toFrame, e.toId, e.gap]),
+      `迭代 ${iter} 边（含母本稳定裁决）`);
+  }
+  assert.ok(feasibleCases >= 30, `宽松限值可行对拍用例过少: ${feasibleCases}（共 ${checked} 组）`);
 });
